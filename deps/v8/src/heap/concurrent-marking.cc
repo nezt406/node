@@ -19,8 +19,11 @@
 #include "src/heap/objects-visiting.h"
 #include "src/heap/worklist.h"
 #include "src/isolate.h"
+#include "src/objects/data-handler-inl.h"
+#include "src/objects/embedder-data-array-inl.h"
 #include "src/objects/hash-table-inl.h"
 #include "src/objects/slots-inl.h"
+#include "src/transitions-inl.h"
 #include "src/utils-inl.h"
 #include "src/utils.h"
 #include "src/v8.h"
@@ -34,11 +37,11 @@ class ConcurrentMarkingState final
   explicit ConcurrentMarkingState(MemoryChunkDataMap* memory_chunk_data)
       : memory_chunk_data_(memory_chunk_data) {}
 
-  Bitmap* bitmap(const MemoryChunk* chunk) {
+  ConcurrentBitmap<AccessMode::ATOMIC>* bitmap(const MemoryChunk* chunk) {
     DCHECK_EQ(reinterpret_cast<intptr_t>(&chunk->marking_bitmap_) -
                   reinterpret_cast<intptr_t>(chunk),
               MemoryChunk::kMarkBitmapOffset);
-    return chunk->marking_bitmap_;
+    return chunk->marking_bitmap<AccessMode::ATOMIC>();
   }
 
   void IncrementLiveBytes(MemoryChunk* chunk, intptr_t by) {
@@ -225,8 +228,7 @@ class ConcurrentMarkingVisitor final
       if (marking_state_.IsBlackOrGrey(target)) {
         // Record the slot inside the JSWeakRef, since the
         // VisitJSObjectSubclass above didn't visit it.
-        ObjectSlot slot =
-            HeapObject::RawField(weak_ref, JSWeakRef::kTargetOffset);
+        ObjectSlot slot = weak_ref.RawField(JSWeakRef::kTargetOffset);
         MarkCompactCollector::RecordSlot(weak_ref, slot, target);
       } else {
         // JSWeakRef points to a potentially dead object. We have to process
@@ -237,24 +239,23 @@ class ConcurrentMarkingVisitor final
     return size;
   }
 
-  int VisitJSWeakCell(Map map, JSWeakCell weak_cell) {
-    int size = VisitJSObjectSubclass(map, weak_cell);
-    if (size == 0) {
-      return 0;
-    }
+  int VisitWeakCell(Map map, WeakCell weak_cell) {
+    if (!ShouldVisit(weak_cell)) return 0;
 
+    int size = WeakCell::BodyDescriptor::SizeOf(map, weak_cell);
+    VisitMapPointer(weak_cell, weak_cell->map_slot());
+    WeakCell::BodyDescriptor::IterateBody(map, weak_cell, size, this);
     if (weak_cell->target()->IsHeapObject()) {
       HeapObject target = HeapObject::cast(weak_cell->target());
       if (marking_state_.IsBlackOrGrey(target)) {
-        // Record the slot inside the JSWeakCell, since the
-        // VisitJSObjectSubclass above didn't visit it.
-        ObjectSlot slot =
-            HeapObject::RawField(weak_cell, JSWeakCell::kTargetOffset);
+        // Record the slot inside the WeakCell, since the IterateBody above
+        // didn't visit it.
+        ObjectSlot slot = weak_cell.RawField(WeakCell::kTargetOffset);
         MarkCompactCollector::RecordSlot(weak_cell, slot, target);
       } else {
-        // JSWeakCell points to a potentially dead object. We have to process
+        // WeakCell points to a potentially dead object. We have to process
         // them when we know the liveness of the whole transitive closure.
-        weak_objects_->js_weak_cells.Push(task_id_, weak_cell);
+        weak_objects_->weak_cells.Push(task_id_, weak_cell);
       }
     }
     return size;
@@ -328,8 +329,7 @@ class ConcurrentMarkingVisitor final
         Max(FixedArray::BodyDescriptor::kStartOffset, chunk->progress_bar());
     int end = Min(size, start + kProgressBarScanningChunk);
     if (start < end) {
-      VisitPointers(object, HeapObject::RawField(object, start),
-                    HeapObject::RawField(object, end));
+      VisitPointers(object, object.RawField(start), object.RawField(end));
       chunk->set_progress_bar(end);
       if (end < size) {
         // The object can be pushed back onto the marking worklist only after
@@ -505,7 +505,7 @@ class ConcurrentMarkingVisitor final
 
   // Implements ephemeron semantics: Marks value if key is already reachable.
   // Returns true if value was actually marked.
-  bool VisitEphemeron(HeapObject key, HeapObject value) {
+  bool ProcessEphemeron(HeapObject key, HeapObject value) {
     if (marking_state_.IsBlackOrGrey(key)) {
       if (marking_state_.WhiteToGrey(value)) {
         shared_.Push(value);
@@ -578,7 +578,7 @@ class ConcurrentMarkingVisitor final
 
     void VisitCustomWeakPointers(HeapObject host, ObjectSlot start,
                                  ObjectSlot end) override {
-      DCHECK(host->IsJSWeakCell() || host->IsJSWeakRef());
+      DCHECK(host->IsWeakCell() || host->IsJSWeakRef());
     }
 
    private:
@@ -773,7 +773,7 @@ void ConcurrentMarking::Run(int task_id, TaskState* task_state) {
       Ephemeron ephemeron;
 
       while (weak_objects_->current_ephemerons.Pop(task_id, &ephemeron)) {
-        if (visitor.VisitEphemeron(ephemeron.key, ephemeron.value)) {
+        if (visitor.ProcessEphemeron(ephemeron.key, ephemeron.value)) {
           ephemeron_marked = true;
         }
       }
@@ -794,8 +794,10 @@ void ConcurrentMarking::Run(int task_id, TaskState* task_state) {
         // The order of the two loads is important.
         Address new_space_top = heap_->new_space()->original_top_acquire();
         Address new_space_limit = heap_->new_space()->original_limit_relaxed();
+        Address new_large_object = heap_->new_lo_space()->pending_object();
         Address addr = object->address();
-        if (new_space_top <= addr && addr < new_space_limit) {
+        if ((new_space_top <= addr && addr < new_space_limit) ||
+            addr == new_large_object) {
           on_hold_->Push(task_id, object);
         } else {
           Map map = object->synchronized_map();
@@ -816,7 +818,7 @@ void ConcurrentMarking::Run(int task_id, TaskState* task_state) {
       Ephemeron ephemeron;
 
       while (weak_objects_->discovered_ephemerons.Pop(task_id, &ephemeron)) {
-        if (visitor.VisitEphemeron(ephemeron.key, ephemeron.value)) {
+        if (visitor.ProcessEphemeron(ephemeron.key, ephemeron.value)) {
           ephemeron_marked = true;
         }
       }
@@ -833,7 +835,7 @@ void ConcurrentMarking::Run(int task_id, TaskState* task_state) {
     weak_objects_->discovered_ephemerons.FlushToGlobal(task_id);
     weak_objects_->weak_references.FlushToGlobal(task_id);
     weak_objects_->js_weak_refs.FlushToGlobal(task_id);
-    weak_objects_->js_weak_cells.FlushToGlobal(task_id);
+    weak_objects_->weak_cells.FlushToGlobal(task_id);
     weak_objects_->weak_objects_in_code.FlushToGlobal(task_id);
     weak_objects_->bytecode_flushing_candidates.FlushToGlobal(task_id);
     weak_objects_->flushed_js_functions.FlushToGlobal(task_id);

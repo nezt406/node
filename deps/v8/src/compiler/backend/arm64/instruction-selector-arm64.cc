@@ -620,9 +620,35 @@ void InstructionSelector::VisitLoad(Node* node) {
       opcode = kArm64LdrW;
       immediate_mode = kLoadStoreImm32;
       break;
+#ifdef V8_COMPRESS_POINTERS
+    case MachineRepresentation::kTaggedSigned:
+      opcode = kArm64LdrDecompressTaggedSigned;
+      immediate_mode = kLoadStoreImm32;
+      break;
+    case MachineRepresentation::kTaggedPointer:
+      opcode = kArm64LdrDecompressTaggedPointer;
+      immediate_mode = kLoadStoreImm32;
+      break;
+    case MachineRepresentation::kTagged:
+      opcode = kArm64LdrDecompressAnyTagged;
+      immediate_mode = kLoadStoreImm32;
+      break;
+    case MachineRepresentation::kCompressedSigned:
+    case MachineRepresentation::kCompressedPointer:
+    case MachineRepresentation::kCompressed:
+      opcode = kArm64LdrW;
+      immediate_mode = kLoadStoreImm32;
+      break;
+#else
+    case MachineRepresentation::kCompressedSigned:   // Fall through.
+    case MachineRepresentation::kCompressedPointer:  // Fall through.
+    case MachineRepresentation::kCompressed:
+      UNREACHABLE();
+      return;
     case MachineRepresentation::kTaggedSigned:   // Fall through.
     case MachineRepresentation::kTaggedPointer:  // Fall through.
     case MachineRepresentation::kTagged:         // Fall through.
+#endif
     case MachineRepresentation::kWord64:
       opcode = kArm64Ldr;
       immediate_mode = kLoadStoreImm64;
@@ -678,21 +704,8 @@ void InstructionSelector::VisitStore(Node* node) {
       addressing_mode = kMode_MRR;
     }
     inputs[input_count++] = g.UseUniqueRegister(value);
-    RecordWriteMode record_write_mode = RecordWriteMode::kValueIsAny;
-    switch (write_barrier_kind) {
-      case kNoWriteBarrier:
-        UNREACHABLE();
-        break;
-      case kMapWriteBarrier:
-        record_write_mode = RecordWriteMode::kValueIsMap;
-        break;
-      case kPointerWriteBarrier:
-        record_write_mode = RecordWriteMode::kValueIsPointer;
-        break;
-      case kFullWriteBarrier:
-        record_write_mode = RecordWriteMode::kValueIsAny;
-        break;
-    }
+    RecordWriteMode record_write_mode =
+        WriteBarrierKindToRecordWriteMode(write_barrier_kind);
     InstructionOperand temps[] = {g.TempRegister(), g.TempRegister()};
     size_t const temp_count = arraysize(temps);
     InstructionCode code = kArchStoreWithWriteBarrier;
@@ -726,9 +739,29 @@ void InstructionSelector::VisitStore(Node* node) {
         opcode = kArm64StrW;
         immediate_mode = kLoadStoreImm32;
         break;
+#ifdef V8_COMPRESS_POINTERS
+      case MachineRepresentation::kTaggedSigned:
+      case MachineRepresentation::kTaggedPointer:
+      case MachineRepresentation::kTagged:
+        opcode = kArm64StrCompressTagged;
+        immediate_mode = kLoadStoreImm32;
+        break;
+      case MachineRepresentation::kCompressedSigned:
+      case MachineRepresentation::kCompressedPointer:
+      case MachineRepresentation::kCompressed:
+        opcode = kArm64StrW;
+        immediate_mode = kLoadStoreImm32;
+        break;
+#else
+      case MachineRepresentation::kCompressedSigned:   // Fall through.
+      case MachineRepresentation::kCompressedPointer:  // Fall through.
+      case MachineRepresentation::kCompressed:
+        UNREACHABLE();
+        return;
       case MachineRepresentation::kTaggedSigned:   // Fall through.
       case MachineRepresentation::kTaggedPointer:  // Fall through.
       case MachineRepresentation::kTagged:         // Fall through.
+#endif
       case MachineRepresentation::kWord64:
         opcode = kArm64Str;
         immediate_mode = kLoadStoreImm64;
@@ -1258,11 +1291,6 @@ void InstructionSelector::VisitWord64Ctz(Node* node) { UNREACHABLE(); }
 void InstructionSelector::VisitWord32Popcnt(Node* node) { UNREACHABLE(); }
 
 void InstructionSelector::VisitWord64Popcnt(Node* node) { UNREACHABLE(); }
-
-void InstructionSelector::VisitSpeculationFence(Node* node) {
-  Arm64OperandGenerator g(this);
-  Emit(kArm64DsbIsb, g.NoOutput());
-}
 
 void InstructionSelector::VisitInt32Add(Node* node) {
   Arm64OperandGenerator g(this);
@@ -3248,8 +3276,7 @@ InstructionSelector::SupportedMachineOperatorFlags() {
          MachineOperatorBuilder::kInt32DivIsSafe |
          MachineOperatorBuilder::kUint32DivIsSafe |
          MachineOperatorBuilder::kWord32ReverseBits |
-         MachineOperatorBuilder::kWord64ReverseBits |
-         MachineOperatorBuilder::kSpeculationFence;
+         MachineOperatorBuilder::kWord64ReverseBits;
 }
 
 // static

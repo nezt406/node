@@ -180,7 +180,7 @@ Handle<String> MessageHandler::GetMessage(Isolate* isolate,
                                           Handle<Object> data) {
   Handle<JSMessageObject> message = Handle<JSMessageObject>::cast(data);
   Handle<Object> arg = Handle<Object>(message->argument(), isolate);
-  return MessageFormatter::FormatMessage(isolate, message->type(), arg);
+  return MessageFormatter::Format(isolate, message->type(), arg);
 }
 
 std::unique_ptr<char[]> MessageHandler::GetLocalizedMessage(
@@ -292,6 +292,11 @@ MaybeHandle<String> FormatEvalOrigin(Isolate* isolate, Handle<Script> script) {
 Handle<Object> StackFrameBase::GetEvalOrigin() {
   if (!HasScript()) return isolate_->factory()->undefined_value();
   return FormatEvalOrigin(isolate_, GetScript()).ToHandleChecked();
+}
+
+int StackFrameBase::GetScriptId() const {
+  if (!HasScript()) return kNone;
+  return GetScript()->id();
 }
 
 bool StackFrameBase::IsEval() {
@@ -462,7 +467,7 @@ Handle<Object> JSStackFrame::GetTypeName() {
 int JSStackFrame::GetLineNumber() {
   DCHECK_LE(0, GetPosition());
   if (HasScript()) return Script::GetLineNumber(GetScript(), GetPosition()) + 1;
-  return -1;
+  return kNone;
 }
 
 int JSStackFrame::GetColumnNumber() {
@@ -470,11 +475,11 @@ int JSStackFrame::GetColumnNumber() {
   if (HasScript()) {
     return Script::GetColumnNumber(GetScript(), GetPosition()) + 1;
   }
-  return -1;
+  return kNone;
 }
 
 int JSStackFrame::GetPromiseIndex() const {
-  return is_promise_all_ ? offset_ : -1;
+  return is_promise_all_ ? offset_ : kNone;
 }
 
 bool JSStackFrame::IsNative() {
@@ -516,14 +521,14 @@ void AppendFileLocation(Isolate* isolate, StackFrameBase* call_site,
   }
 
   int line_number = call_site->GetLineNumber();
-  if (line_number != -1) {
+  if (line_number != StackFrameBase::kNone) {
     builder->AppendCharacter(':');
     Handle<String> line_string = isolate->factory()->NumberToString(
         handle(Smi::FromInt(line_number), isolate), isolate);
     builder->AppendString(line_string);
 
     int column_number = call_site->GetColumnNumber();
-    if (column_number != -1) {
+    if (column_number != StackFrameBase::kNone) {
       builder->AppendCharacter(':');
       Handle<String> column_string = isolate->factory()->NumberToString(
           handle(Smi::FromInt(column_number), isolate), isolate);
@@ -838,33 +843,33 @@ MaybeHandle<String> AsmJsWasmStackFrame::ToString() {
 
 FrameArrayIterator::FrameArrayIterator(Isolate* isolate,
                                        Handle<FrameArray> array, int frame_ix)
-    : isolate_(isolate), array_(array), next_frame_ix_(frame_ix) {}
+    : isolate_(isolate), array_(array), frame_ix_(frame_ix) {}
 
-bool FrameArrayIterator::HasNext() const {
-  return (next_frame_ix_ < array_->FrameCount());
+bool FrameArrayIterator::HasFrame() const {
+  return (frame_ix_ < array_->FrameCount());
 }
 
-void FrameArrayIterator::Next() { next_frame_ix_++; }
+void FrameArrayIterator::Advance() { frame_ix_++; }
 
 StackFrameBase* FrameArrayIterator::Frame() {
-  DCHECK(HasNext());
-  const int flags = array_->Flags(next_frame_ix_)->value();
+  DCHECK(HasFrame());
+  const int flags = array_->Flags(frame_ix_)->value();
   int flag_mask = FrameArray::kIsWasmFrame |
                   FrameArray::kIsWasmInterpretedFrame |
                   FrameArray::kIsAsmJsWasmFrame;
   switch (flags & flag_mask) {
     case 0:
       // JavaScript Frame.
-      js_frame_.FromFrameArray(isolate_, array_, next_frame_ix_);
+      js_frame_.FromFrameArray(isolate_, array_, frame_ix_);
       return &js_frame_;
     case FrameArray::kIsWasmFrame:
     case FrameArray::kIsWasmInterpretedFrame:
       // Wasm Frame:
-      wasm_frame_.FromFrameArray(isolate_, array_, next_frame_ix_);
+      wasm_frame_.FromFrameArray(isolate_, array_, frame_ix_);
       return &wasm_frame_;
     case FrameArray::kIsAsmJsWasmFrame:
       // Asm.js Wasm Frame:
-      asm_wasm_frame_.FromFrameArray(isolate_, array_, next_frame_ix_);
+      asm_wasm_frame_.FromFrameArray(isolate_, array_, frame_ix_);
       return &asm_wasm_frame_;
     default:
       UNREACHABLE();
@@ -1040,7 +1045,7 @@ MaybeHandle<Object> ErrorUtils::FormatStackTrace(Isolate* isolate,
   RETURN_ON_EXCEPTION(isolate, AppendErrorString(isolate, error, &builder),
                       Object);
 
-  for (FrameArrayIterator it(isolate, elems); it.HasNext(); it.Next()) {
+  for (FrameArrayIterator it(isolate, elems); it.HasFrame(); it.Advance()) {
     builder.AppendCString("\n    at ");
 
     StackFrameBase* frame = it.Frame();
@@ -1075,12 +1080,11 @@ MaybeHandle<Object> ErrorUtils::FormatStackTrace(Isolate* isolate,
   return builder.Finish();
 }
 
-Handle<String> MessageFormatter::FormatMessage(Isolate* isolate,
-                                               MessageTemplate index,
-                                               Handle<Object> arg) {
+Handle<String> MessageFormatter::Format(Isolate* isolate, MessageTemplate index,
+                                        Handle<Object> arg) {
   Factory* factory = isolate->factory();
   Handle<String> result_string = Object::NoSideEffectsToString(isolate, arg);
-  MaybeHandle<String> maybe_result_string = MessageFormatter::FormatMessage(
+  MaybeHandle<String> maybe_result_string = MessageFormatter::Format(
       isolate, index, result_string, factory->empty_string(),
       factory->empty_string());
   if (!maybe_result_string.ToHandle(&result_string)) {
@@ -1109,11 +1113,11 @@ const char* MessageFormatter::TemplateString(MessageTemplate index) {
   }
 }
 
-MaybeHandle<String> MessageFormatter::FormatMessage(Isolate* isolate,
-                                                    MessageTemplate index,
-                                                    Handle<String> arg0,
-                                                    Handle<String> arg1,
-                                                    Handle<String> arg2) {
+MaybeHandle<String> MessageFormatter::Format(Isolate* isolate,
+                                             MessageTemplate index,
+                                             Handle<String> arg0,
+                                             Handle<String> arg1,
+                                             Handle<String> arg2) {
   const char* template_string = TemplateString(index);
   if (template_string == nullptr) {
     isolate->ThrowIllegalOperation();
@@ -1270,9 +1274,9 @@ MaybeHandle<String> ErrorUtils::ToString(Isolate* isolate,
 
 namespace {
 
-Handle<String> FormatMessage(Isolate* isolate, MessageTemplate index,
-                             Handle<Object> arg0, Handle<Object> arg1,
-                             Handle<Object> arg2) {
+Handle<String> DoFormatMessage(Isolate* isolate, MessageTemplate index,
+                               Handle<Object> arg0, Handle<Object> arg1,
+                               Handle<Object> arg2) {
   Handle<String> arg0_str = Object::NoSideEffectsToString(isolate, arg0);
   Handle<String> arg1_str = Object::NoSideEffectsToString(isolate, arg1);
   Handle<String> arg2_str = Object::NoSideEffectsToString(isolate, arg2);
@@ -1280,8 +1284,7 @@ Handle<String> FormatMessage(Isolate* isolate, MessageTemplate index,
   isolate->native_context()->IncrementErrorsThrown();
 
   Handle<String> msg;
-  if (!MessageFormatter::FormatMessage(isolate, index, arg0_str, arg1_str,
-                                       arg2_str)
+  if (!MessageFormatter::Format(isolate, index, arg0_str, arg1_str, arg2_str)
            .ToHandle(&msg)) {
     DCHECK(isolate->has_pending_exception());
     isolate->clear_pending_exception();
@@ -1309,7 +1312,7 @@ MaybeHandle<Object> ErrorUtils::MakeGenericError(
   DCHECK(mode != SKIP_UNTIL_SEEN);
 
   Handle<Object> no_caller;
-  Handle<String> msg = FormatMessage(isolate, index, arg0, arg1, arg2);
+  Handle<String> msg = DoFormatMessage(isolate, index, arg0, arg1, arg2);
   return ErrorUtils::Construct(isolate, constructor, constructor, msg, mode,
                                no_caller, false);
 }

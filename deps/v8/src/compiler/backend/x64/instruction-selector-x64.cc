@@ -69,7 +69,10 @@ class X64OperandGenerator final : public OperandGenerator {
       case kX64Push:
       case kX64Cmp:
       case kX64Test:
-        return rep == MachineRepresentation::kWord64 || IsAnyTagged(rep);
+        // When pointer compression is enabled 64-bit memory operands can't be
+        // used for tagged values.
+        return rep == MachineRepresentation::kWord64 ||
+               (!COMPRESS_POINTERS_BOOL && IsAnyTagged(rep));
       case kX64And32:
       case kX64Or32:
       case kX64Xor32:
@@ -77,7 +80,10 @@ class X64OperandGenerator final : public OperandGenerator {
       case kX64Sub32:
       case kX64Cmp32:
       case kX64Test32:
-        return rep == MachineRepresentation::kWord32;
+        // When pointer compression is enabled 32-bit memory operands can be
+        // used for tagged values.
+        return rep == MachineRepresentation::kWord32 ||
+               (COMPRESS_POINTERS_BOOL && IsAnyTagged(rep));
       case kX64Cmp16:
       case kX64Test16:
         return rep == MachineRepresentation::kWord16;
@@ -236,15 +242,30 @@ ArchOpcode GetLoadOpcode(LoadRepresentation load_rep) {
       break;
 #ifdef V8_COMPRESS_POINTERS
     case MachineRepresentation::kTaggedSigned:
-      return kX64MovqDecompressTaggedSigned;
+      opcode = kX64MovqDecompressTaggedSigned;
+      break;
     case MachineRepresentation::kTaggedPointer:
-      return kX64MovqDecompressTaggedPointer;
+      opcode = kX64MovqDecompressTaggedPointer;
+      break;
     case MachineRepresentation::kTagged:
-      return kX64MovqDecompressAnyTagged;
+      opcode = kX64MovqDecompressAnyTagged;
+      break;
+    case MachineRepresentation::kCompressedSigned:   // Fall through.
+    case MachineRepresentation::kCompressedPointer:  // Fall through.
+    case MachineRepresentation::kCompressed:
+      opcode = kX64Movl;
+      break;
 #else
+    case MachineRepresentation::kCompressedSigned:   // Fall through.
+    case MachineRepresentation::kCompressedPointer:  // Fall through.
+    case MachineRepresentation::kCompressed:
+      UNREACHABLE();
+      break;
     case MachineRepresentation::kTaggedSigned:   // Fall through.
     case MachineRepresentation::kTaggedPointer:  // Fall through.
-    case MachineRepresentation::kTagged:         // Fall through.
+    case MachineRepresentation::kTagged:
+      opcode = kX64Movq;
+      break;
 #endif
     case MachineRepresentation::kWord64:
       opcode = kX64Movq;
@@ -277,9 +298,26 @@ ArchOpcode GetStoreOpcode(StoreRepresentation store_rep) {
     case MachineRepresentation::kWord32:
       return kX64Movl;
       break;
+#ifdef V8_COMPRESS_POINTERS
     case MachineRepresentation::kTaggedSigned:   // Fall through.
     case MachineRepresentation::kTaggedPointer:  // Fall through.
-    case MachineRepresentation::kTagged:         // Fall through.
+    case MachineRepresentation::kTagged:
+      return kX64MovqCompressTagged;
+    case MachineRepresentation::kCompressedSigned:   // Fall through.
+    case MachineRepresentation::kCompressedPointer:  // Fall through.
+    case MachineRepresentation::kCompressed:
+      return kX64Movl;
+#else
+    case MachineRepresentation::kCompressedSigned:   // Fall through.
+    case MachineRepresentation::kCompressedPointer:  // Fall through.
+    case MachineRepresentation::kCompressed:
+      UNREACHABLE();
+    case MachineRepresentation::kTaggedSigned:   // Fall through.
+    case MachineRepresentation::kTaggedPointer:  // Fall through.
+    case MachineRepresentation::kTagged:
+      return kX64Movq;
+      break;
+#endif
     case MachineRepresentation::kWord64:
       return kX64Movq;
       break;
@@ -308,30 +346,16 @@ void InstructionSelector::VisitDebugAbort(Node* node) {
   Emit(kArchDebugAbort, g.NoOutput(), g.UseFixed(node->InputAt(0), rdx));
 }
 
-void InstructionSelector::VisitSpeculationFence(Node* node) {
-  X64OperandGenerator g(this);
-  Emit(kLFence, g.NoOutput());
-}
-
 void InstructionSelector::VisitLoad(Node* node) {
   LoadRepresentation load_rep = LoadRepresentationOf(node->op());
   X64OperandGenerator g(this);
 
   ArchOpcode opcode = GetLoadOpcode(load_rep);
   size_t temp_count = 0;
-  InstructionOperand temps[2];
-#ifdef V8_COMPRESS_POINTERS
-  if (opcode == kX64MovqDecompressAnyTagged) {
+  InstructionOperand temps[1];
+  if (COMPRESS_POINTERS_BOOL && opcode == kX64MovqDecompressAnyTagged) {
     temps[temp_count++] = g.TempRegister();
   }
-#ifdef DEBUG
-  if (opcode == kX64MovqDecompressTaggedSigned ||
-      opcode == kX64MovqDecompressTaggedPointer ||
-      opcode == kX64MovqDecompressAnyTagged) {
-    temps[temp_count++] = g.TempRegister();
-  }
-#endif  // DEBUG
-#endif  // V8_COMPRESS_POINTERS
   DCHECK_LE(temp_count, arraysize(temps));
   InstructionOperand outputs[] = {g.DefineAsRegister(node)};
   InstructionOperand inputs[3];
@@ -368,21 +392,8 @@ void InstructionSelector::VisitStore(Node* node) {
         g.UseUniqueRegister(base),
         g.GetEffectiveIndexOperand(index, &addressing_mode),
         g.UseUniqueRegister(value)};
-    RecordWriteMode record_write_mode = RecordWriteMode::kValueIsAny;
-    switch (write_barrier_kind) {
-      case kNoWriteBarrier:
-        UNREACHABLE();
-        break;
-      case kMapWriteBarrier:
-        record_write_mode = RecordWriteMode::kValueIsMap;
-        break;
-      case kPointerWriteBarrier:
-        record_write_mode = RecordWriteMode::kValueIsPointer;
-        break;
-      case kFullWriteBarrier:
-        record_write_mode = RecordWriteMode::kValueIsAny;
-        break;
-    }
+    RecordWriteMode record_write_mode =
+        WriteBarrierKindToRecordWriteMode(write_barrier_kind);
     InstructionOperand temps[] = {g.TempRegister(), g.TempRegister()};
     InstructionCode code = kArchStoreWithWriteBarrier;
     code |= AddressingModeField::encode(addressing_mode);
@@ -572,6 +583,8 @@ bool TryMergeTruncateInt64ToInt32IntoLoad(InstructionSelector* selector,
       case MachineRepresentation::kWord64:
       case MachineRepresentation::kTaggedSigned:
       case MachineRepresentation::kTagged:
+      case MachineRepresentation::kCompressedSigned:  // Fall through.
+      case MachineRepresentation::kCompressed:        // Fall through.
         opcode = kX64Movl;
         break;
       default:
@@ -1692,6 +1705,15 @@ InstructionCode TryNarrowOpcodeSize(InstructionCode opcode, Node* left,
           return kX64Cmp16;
         }
         break;
+#ifdef V8_COMPRESS_POINTERS
+      case MachineRepresentation::kTaggedSigned:
+      case MachineRepresentation::kTaggedPointer:
+      case MachineRepresentation::kTagged:
+        // When pointer compression is enabled the lower 32-bits uniquely
+        // identify tagged value.
+        if (opcode == kX64Cmp) return kX64Cmp32;
+        break;
+#endif
       default:
         break;
     }
@@ -3057,8 +3079,7 @@ MachineOperatorBuilder::Flags
 InstructionSelector::SupportedMachineOperatorFlags() {
   MachineOperatorBuilder::Flags flags =
       MachineOperatorBuilder::kWord32ShiftIsSafe |
-      MachineOperatorBuilder::kWord32Ctz | MachineOperatorBuilder::kWord64Ctz |
-      MachineOperatorBuilder::kSpeculationFence;
+      MachineOperatorBuilder::kWord32Ctz | MachineOperatorBuilder::kWord64Ctz;
   if (CpuFeatures::IsSupported(POPCNT)) {
     flags |= MachineOperatorBuilder::kWord32Popcnt |
              MachineOperatorBuilder::kWord64Popcnt;

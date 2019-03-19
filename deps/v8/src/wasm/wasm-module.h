@@ -120,6 +120,10 @@ struct WasmElemSegment {
   // Construct a passive segment, which has no table index or offset.
   WasmElemSegment() : table_index(0), active(false) {}
 
+  // Used in the {entries} vector to represent a `ref.null` entry in a passive
+  // segment.
+  static const uint32_t kNullIndex = ~0u;
+
   uint32_t table_index;
   WasmInitExpr offset;
   std::vector<uint32_t> entries;
@@ -128,17 +132,37 @@ struct WasmElemSegment {
 
 // Static representation of a wasm import.
 struct WasmImport {
-  WireBytesRef module_name;  // module name.
-  WireBytesRef field_name;   // import name.
+  WireBytesRef module_name;   // module name.
+  WireBytesRef field_name;    // import name.
   ImportExportKindCode kind;  // kind of the import.
-  uint32_t index;            // index into the respective space.
+  uint32_t index;             // index into the respective space.
 };
 
 // Static representation of a wasm export.
 struct WasmExport {
-  WireBytesRef name;      // exported name.
+  WireBytesRef name;          // exported name.
   ImportExportKindCode kind;  // kind of the export.
-  uint32_t index;         // index into the respective space.
+  uint32_t index;             // index into the respective space.
+};
+
+enum class WasmCompilationHintStrategy : uint8_t {
+  kDefault = 0,
+  kLazy = 1,
+  kEager = 2,
+};
+
+enum class WasmCompilationHintTier : uint8_t {
+  kDefault = 0,
+  kInterpreter = 1,
+  kBaseline = 2,
+  kOptimized = 3,
+};
+
+// Static representation of a wasm compilation hint
+struct WasmCompilationHint {
+  WasmCompilationHintStrategy strategy;
+  WasmCompilationHintTier first_tier;
+  WasmCompilationHintTier second_tier;
 };
 
 enum ModuleOrigin : uint8_t { kWasmOrigin, kAsmJsOrigin };
@@ -169,6 +193,7 @@ struct V8_EXPORT_PRIVATE WasmModule {
   uint32_t tagged_globals_buffer_size = 0;
   uint32_t num_imported_mutable_globals = 0;
   uint32_t num_imported_functions = 0;
+  uint32_t num_imported_tables = 0;
   uint32_t num_declared_functions = 0;  // excluding imported
   uint32_t num_exported_functions = 0;
   uint32_t num_declared_data_segments = 0;  // From the DataCount section.
@@ -182,6 +207,7 @@ struct V8_EXPORT_PRIVATE WasmModule {
   std::vector<WasmExport> export_table;
   std::vector<WasmException> exceptions;
   std::vector<WasmElemSegment> elem_segments;
+  std::vector<WasmCompilationHint> compilation_hints;
   SignatureMap signature_map;  // canonicalizing map for signature indexes.
 
   ModuleOrigin origin = kWasmOrigin;  // origin of the module

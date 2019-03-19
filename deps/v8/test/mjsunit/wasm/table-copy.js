@@ -4,7 +4,6 @@
 
 // Flags: --experimental-wasm-bulk-memory
 
-load("test/mjsunit/wasm/wasm-constants.js");
 load("test/mjsunit/wasm/wasm-module-builder.js");
 
 (function TestTableCopyInbounds() {
@@ -20,19 +19,16 @@ load("test/mjsunit/wasm/wasm-module-builder.js");
       kExprGetLocal, 0,
       kExprGetLocal, 1,
       kExprGetLocal, 2,
-      kNumericPrefix, kExprTableCopy, kTableZero])
+      kNumericPrefix, kExprTableCopy, kTableZero, kTableZero])
     .exportAs("copy");
 
   let instance = builder.instantiate();
   let copy = instance.exports.copy;
-  for (let i = 0; i < kTableSize; i++) {
+  for (let i = 0; i <= kTableSize; i++) {
     copy(0, 0, i); // nop
     copy(0, i, kTableSize - i);
     copy(i, 0, kTableSize - i);
   }
-  let big = 1000000;
-  copy(big, 0, 0); // nop
-  copy(0, big, 0); // nop
 })();
 
 function addFunction(builder, k) {
@@ -66,7 +62,7 @@ function assertTable(obj, ...elems) {
 
   {
     let o = addFunctions(builder, kTableSize);
-    builder.addElementSegment(0, false,
+    builder.addElementSegment(0, 0, false,
        [o.f0.index, o.f1.index, o.f2.index, o.f3.index, o.f4.index]);
   }
 
@@ -75,7 +71,7 @@ function assertTable(obj, ...elems) {
       kExprGetLocal, 0,
       kExprGetLocal, 1,
       kExprGetLocal, 2,
-      kNumericPrefix, kExprTableCopy, kTableZero])
+      kNumericPrefix, kExprTableCopy, kTableZero, kTableZero])
     .exportAs("copy");
 
   builder.addExportOfKind("table", kExternalTable, 0);
@@ -120,7 +116,7 @@ function assertCall(call, ...elems) {
 
   {
     let o = addFunctions(builder, 5);
-    builder.addElementSegment(0, false,
+    builder.addElementSegment(0, 0, false,
        [o.f0.index, o.f1.index, o.f2.index, o.f3.index, o.f4.index]);
   }
 
@@ -129,7 +125,7 @@ function assertCall(call, ...elems) {
       kExprGetLocal, 0,
       kExprGetLocal, 1,
       kExprGetLocal, 2,
-      kNumericPrefix, kExprTableCopy, kTableZero])
+      kNumericPrefix, kExprTableCopy, kTableZero, kTableZero])
     .exportAs("copy");
 
   builder.addFunction("call", sig_i_i)
@@ -151,6 +147,54 @@ function assertCall(call, ...elems) {
   assertCall(call, 1, 2, 2, 1, 2);
 })();
 
+(function TestTableCopyOobWrites() {
+  print(arguments.callee.name);
+
+  let builder = new WasmModuleBuilder();
+  let sig_v_iii = builder.addType(kSig_v_iii);
+  let kTableSize = 5;
+
+  builder.setTableBounds(kTableSize, kTableSize);
+
+  {
+    let o = addFunctions(builder, kTableSize);
+    builder.addElementSegment(0, 0, false,
+       [o.f0.index, o.f1.index, o.f2.index]);
+  }
+
+  builder.addFunction("copy", sig_v_iii)
+    .addBody([
+      kExprGetLocal, 0,
+      kExprGetLocal, 1,
+      kExprGetLocal, 2,
+      kNumericPrefix, kExprTableCopy, kTableZero, kTableZero])
+    .exportAs("copy");
+
+  builder.addExportOfKind("table", kExternalTable, 0);
+
+  let instance = builder.instantiate();
+  let table = instance.exports.table;
+  let f0 = table.get(0), f1 = table.get(1), f2 = table.get(2);
+  let copy = instance.exports.copy;
+
+  // Non-overlapping, src < dst.
+  assertThrows(() => copy(3, 0, 3));
+  assertTable(table, f0, f1, f2, f0, f1);
+
+  // Non-overlapping, dst < src.
+  assertThrows(() => copy(0, 4, 2));
+  assertTable(table, f1, f1, f2, f0, f1);
+
+  // Overlapping, src < dst. This is required to copy backward, but the first
+  // access will be out-of-bounds, so nothing changes.
+  assertThrows(() => copy(3, 0, 99));
+  assertTable(table, f1, f1, f2, f0, f1);
+
+  // Overlapping, dst < src.
+  assertThrows(() => copy(0, 1, 99));
+  assertTable(table, f1, f2, f0, f1, f1);
+})();
+
 (function TestTableCopyOob1() {
   print(arguments.callee.name);
 
@@ -165,7 +209,7 @@ function assertCall(call, ...elems) {
       kExprGetLocal, 0,
       kExprGetLocal, 1,
       kExprGetLocal, 2,
-      kNumericPrefix, kExprTableCopy, kTableZero])
+      kNumericPrefix, kExprTableCopy, kTableZero, kTableZero])
     .exportAs("copy");
 
   let instance = builder.instantiate();
@@ -175,6 +219,13 @@ function assertCall(call, ...elems) {
   assertThrows(() => copy(0, 0, kTableSize+1));
   assertThrows(() => copy(1, 0, kTableSize));
   assertThrows(() => copy(0, 1, kTableSize));
+
+  {
+    let big = 1000000;
+    assertThrows(() => copy(big, 0, 0));
+    assertThrows(() => copy(0, big, 0));
+  }
+
 
   for (let big = 4294967295; big > 1000; big >>>= 1) {
     assertThrows(() => copy(big, 0, 1));
@@ -187,6 +238,7 @@ function assertCall(call, ...elems) {
     assertThrows(() => copy(0, big, 1));
     assertThrows(() => copy(0, 0, big));
   }
+
 })();
 
 (function TestTableCopyShared() {
@@ -221,7 +273,7 @@ function assertCall(call, ...elems) {
         kExprGetLocal, 0,
         kExprGetLocal, 1,
         kExprGetLocal, 2,
-        kNumericPrefix, kExprTableCopy, kTableZero])
+        kNumericPrefix, kExprTableCopy, kTableZero, kTableZero])
       .exportAs("copy");
 
     builder.addFunction("call", sig_i_i)
